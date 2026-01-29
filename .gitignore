@@ -1,0 +1,13 @@
+# Environment files with secrets
+infra-ids.env
+*.pem
+
+# Node modules
+node_modules/
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

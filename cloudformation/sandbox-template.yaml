@@ -1,0 +1,422 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Ephemeral Sandbox Environment for Todo Application with auto-termination features'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: sandbox
+    Description: Name of the sandbox environment
+  
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID for the todo application EC2 instance
+  
+  DBSnapshotIdentifier:
+    Type: String
+    Description: RDS snapshot identifier to restore the database from
+  
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type
+  
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+    Description: RDS instance class
+  
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair for SSH access
+  
+  ExpirationTimeMinutes:
+    Type: Number
+    Default: 480
+    MinValue: 60
+    Description: 'Minutes until auto-termination (default: 480 = 8 hours)'
+  
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Database password
+    MinLength: 8
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-subnet'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-subnet-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.3.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-subnet-2'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-rt'
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-ec2-sg'
+      GroupDescription: Security group for todo app EC2
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ec2-sg'
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-rds-sg'
+      GroupDescription: Security group for todo app RDS
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-rds-sg'
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for todo app RDS
+      DBSubnetGroupName: !Sub '${EnvironmentName}-db-subnet-group'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-db-subnet-group'
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-db'
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      DBSnapshotIdentifier: !Ref DBSnapshotIdentifier
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-db'
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: RDSInstance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      SubnetId: !Ref PublicSubnet
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          cat > /opt/todo-app/.env << EOF
+          DB_HOST=${RDSInstance.Endpoint.Address}
+          DB_PORT=5432
+          DB_NAME=todoapp
+          DB_USER=todouser
+          DB_PASSWORD=${DBPassword}
+          PORT=3000
+          EOF
+          chown ec2-user:ec2-user /opt/todo-app/.env
+          systemctl restart todo-app
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ec2'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudFormationDeletePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                  - rds:*
+                  - logs:*
+                  - events:*
+                  - lambda:*
+                  - iam:*
+                  - cloudwatch:GetMetricStatistics
+                Resource: '*'
+
+  ScheduledTerminationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-scheduled-termination'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          def handler(event, context):
+              stack_name = os.environ['STACK_NAME']
+              cf_client = boto3.client('cloudformation')
+              
+              print(f"Initiating scheduled termination of stack: {stack_name}")
+              
+              try:
+                  cf_client.delete_stack(StackName=stack_name)
+                  print(f"Stack deletion initiated for: {stack_name}")
+                  return {
+                      'statusCode': 200,
+                      'body': f'Stack {stack_name} deletion initiated'
+                  }
+              except Exception as e:
+                  print(f"Error deleting stack: {str(e)}")
+                  raise e
+
+  ScheduledTerminationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-scheduled-termination-rule'
+      Description: Triggers stack deletion after expiration time
+      ScheduleExpression: !Sub 'rate(${ExpirationTimeMinutes} minutes)'
+      State: ENABLED
+      Targets:
+        - Id: ScheduledTerminationTarget
+          Arn: !GetAtt ScheduledTerminationLambda.Arn
+
+  ScheduledTerminationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScheduledTerminationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledTerminationRule.Arn
+
+  IdleCheckLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-idle-check'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+          INSTANCE_ID: !Ref EC2Instance
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+
+          def handler(event, context):
+              stack_name = os.environ['STACK_NAME']
+              instance_id = os.environ['INSTANCE_ID']
+              
+              cw_client = boto3.client('cloudwatch')
+              cf_client = boto3.client('cloudformation')
+              
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(hours=1)
+              
+              response = cw_client.get_metric_statistics(
+                  Namespace='AWS/EC2',
+                  MetricName='NetworkPacketsIn',
+                  Dimensions=[
+                      {
+                          'Name': 'InstanceId',
+                          'Value': instance_id
+                      }
+                  ],
+                  StartTime=start_time,
+                  EndTime=end_time,
+                  Period=3600,
+                  Statistics=['Sum']
+              )
+              
+              datapoints = response.get('Datapoints', [])
+              
+              if not datapoints:
+                  print("No datapoints found, assuming idle")
+                  total_packets = 0
+              else:
+                  total_packets = sum(dp['Sum'] for dp in datapoints)
+              
+              print(f"Total network packets in last hour: {total_packets}")
+              
+              if total_packets == 0:
+                  print(f"No network activity detected. Initiating stack deletion: {stack_name}")
+                  try:
+                      cf_client.delete_stack(StackName=stack_name)
+                      return {
+                          'statusCode': 200,
+                          'body': f'Stack {stack_name} deletion initiated due to inactivity'
+                      }
+                  except Exception as e:
+                      print(f"Error deleting stack: {str(e)}")
+                      raise e
+              else:
+                  print(f"Network activity detected ({total_packets} packets). Stack remains active.")
+                  return {
+                      'statusCode': 200,
+                      'body': f'Stack {stack_name} is active with {total_packets} packets'
+                  }
+
+  IdleCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-idle-check-rule'
+      Description: Hourly check for network inactivity
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Id: IdleCheckTarget
+          Arn: !GetAtt IdleCheckLambda.Arn
+
+  IdleCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdleCheckLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IdleCheckRule.Arn
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  EC2PublicIP:
+    Description: Public IP of the EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
+
+  EC2InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+
+  RDSEndpoint:
+    Description: RDS endpoint
+    Value: !GetAtt RDSInstance.Endpoint.Address
+
+  ApplicationURL:
+    Description: URL to access the todo application
+    Value: !Sub 'http://${EC2Instance.PublicIp}:3000'
+
+  ExpirationTimeMinutes:
+    Description: Minutes until scheduled termination
+    Value: !Ref ExpirationTimeMinutes
