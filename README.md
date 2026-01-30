@@ -1,16 +1,67 @@
-# React + Vite
+# Infrastructure Sandbox Ticket Board
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A Jira-like ticket system for managing infrastructure sandbox provisioning requests, with CloudFormation templates for ephemeral sandbox environments.
 
-Currently, two official plugins are available:
+## Project Structure
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+```
+├── ticketing/           # React Kanban board for sandbox requests
+│   └── src/
+│       └── components/  # Board, Column, TicketCard, AddTicketForm
+├── infra-template/      # CloudFormation templates for sandbox provisioning
+│   ├── sandbox-template.yaml
+│   └── README.md
+```
 
-## React Compiler
+## Ticketing Board
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+A drag-and-drop Kanban board with 5 status columns:
+- **Requests** - New sandbox requests
+- **Provisioning** - Sandbox being created
+- **Provisioned** - Sandbox ready for use
+- **Failed** - Provisioning failed
+- **Terminated** - Sandbox destroyed
 
-## Expanding the ESLint configuration
+### Running the Board
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+```bash
+cd ticketing
+npm install
+npm run dev
+```
+
+The board calls an API when tickets are dragged to new columns, logging:
+- `POST /api/tickets` - Create new ticket
+- `PATCH /api/tickets/{id}/status` - Status change
+
+## Infrastructure Template
+
+CloudFormation template that provisions:
+- EC2 instance from pre-configured AMI (`ami-073fce3e092c219a2`)
+- RDS PostgreSQL from snapshot (`sandbox-todo-snapshot-20260129-234617`)
+- Auto-termination via EventBridge (configurable hours)
+- Idle detection (terminates after 1 hour of no network activity)
+
+### Deploy a Sandbox
+
+```bash
+aws cloudformation create-stack \
+  --stack-name sandbox-myenv-001 \
+  --template-body file://infra-template/sandbox-template.yaml \
+  --parameters ParameterKey=SandboxName,ParameterValue=myenv-001 \
+               ParameterKey=ExpirationHours,ParameterValue=8 \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+### Delete a Sandbox
+
+```bash
+aws cloudformation delete-stack --stack-name sandbox-myenv-001
+```
+
+## AI Dispatch Agent Integration
+
+The dispatch agent responds to ticket board API calls by:
+1. **Requests → Provisioning**: Deploy CloudFormation stack
+2. **Any → Terminated**: Delete CloudFormation stack
+3. **Monitor stack events**: Update ticket status based on CloudFormation events

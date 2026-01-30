@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Ephemeral Sandbox Environment with Auto-Termination
+
+Parameters:
+  SandboxName:
+    Type: String
+    Description: Unique name for this sandbox environment
+    AllowedPattern: '[a-z0-9-]+'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  ExpirationHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 168
+    Description: Hours until automatic termination (1-168)
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+    Description: RDS instance class
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-07bda6071f14059c1
+    Description: VPC for the sandbox
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0995d81977be00011
+    Description: Subnet for EC2 instance
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: subnet-0995d81977be00011,subnet-0b86083e60a92e35d
+    Description: Subnets for RDS (need at least 2 AZs)
+
+  AMIId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-073fce3e092c219a2
+    Description: AMI ID for the todo app server
+
+  DBSnapshotIdentifier:
+    Type: String
+    Default: sandbox-todo-snapshot-20260129-234617
+    Description: RDS snapshot to restore from
+
+Resources:
+  # Security Group for EC2
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Security group for ${SandboxName} sandbox app server'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${SandboxName}-app-sg'
+        - Key: Sandbox
+          Value: !Ref SandboxName
+
+  # Security Group for RDS
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Security group for ${SandboxName} sandbox database'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${SandboxName}-db-sg'
+        - Key: Sandbox
+          Value: !Ref SandboxName
+
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub 'Subnet group for ${SandboxName} sandbox'
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${SandboxName}-db-subnet-group'
+        - Key: Sandbox
+          Value: !Ref SandboxName
+
+  # RDS Instance from Snapshot
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${SandboxName}-db'
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      DBSnapshotIdentifier: !Ref DBSnapshotIdentifier
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${SandboxName}-database'
+        - Key: Sandbox
+          Value: !Ref SandboxName
+
+  # IAM Role for EC2 (for CloudWatch and self-termination)
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${SandboxName}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: SandboxSelfTerminate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DeleteStack
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${SandboxName}-instance-profile'
+      Roles:
+        - !Ref EC2Role
+
+  # EC2 Instance from AMI
+  AppServer:
+    Type: AWS::EC2::Instance
+    DependsOn: Database
+    Properties:
+      ImageId: !Ref AMIId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # Update database connection to point to new RDS
+          DB_HOST="${Database.Endpoint.Address}"
+          
+          # Update the app's database configuration
+          if [ -f /home/ec2-user/todo-app/.env ]; then
+            sed -i "s|DATABASE_HOST=.*|DATABASE_HOST=$DB_HOST|" /home/ec2-user/todo-app/.env
+          fi
+          
+          # Create environment file if it doesn't exist
+          cat > /home/ec2-user/todo-app/.env << EOF
+          DATABASE_HOST=$DB_HOST
+          DATABASE_PORT=5432
+          DATABASE_NAME=tododb
+          DATABASE_USER=todouser
+          DATABASE_PASSWORD=todopassword123
+          PORT=3000
+          EOF
+          
+          chown ec2-user:ec2-user /home/ec2-user/todo-app/.env
+          
+          # Restart the application
+          systemctl restart todo-app || true
+          
+          # Install and configure idle monitor
+          cat > /home/ec2-user/idle-monitor.sh << 'MONITOR'
+          #!/bin/bash
+          STACK_NAME="${AWS::StackName}"
+          REGION="${AWS::Region}"
+          IDLE_THRESHOLD=3600  # 1 hour in seconds
+          
+          # Get network stats
+          get_network_bytes() {
+            cat /proc/net/dev | grep eth0 | awk '{print $2 + $10}'
+          }
+          
+          LAST_BYTES=$(get_network_bytes)
+          LAST_CHECK=$(date +%s)
+          IDLE_START=$LAST_CHECK
+          
+          while true; do
+            sleep 300  # Check every 5 minutes
+            
+            CURRENT_BYTES=$(get_network_bytes)
+            CURRENT_TIME=$(date +%s)
+            
+            # Calculate bytes transferred since last check
+            BYTES_DIFF=$((CURRENT_BYTES - LAST_BYTES))
+            
+            # If significant traffic (more than 10KB), reset idle timer
+            if [ $BYTES_DIFF -gt 10240 ]; then
+              IDLE_START=$CURRENT_TIME
+            fi
+            
+            # Check if idle for more than threshold
+            IDLE_DURATION=$((CURRENT_TIME - IDLE_START))
+            if [ $IDLE_DURATION -ge $IDLE_THRESHOLD ]; then
+              echo "Sandbox idle for $IDLE_DURATION seconds. Initiating termination..."
+              aws cloudformation delete-stack --stack-name $STACK_NAME --region $REGION
+              exit 0
+            fi
+            
+            # Publish idle metric to CloudWatch
+            aws cloudwatch put-metric-data \
+              --namespace "Sandbox/IdleMonitor" \
+              --metric-name "IdleDuration" \
+              --value $IDLE_DURATION \
+              --unit Seconds \
+              --dimensions StackName=$STACK_NAME \
+              --region $REGION
+            
+            LAST_BYTES=$CURRENT_BYTES
+            LAST_CHECK=$CURRENT_TIME
+          done
+          MONITOR
+          
+          chmod +x /home/ec2-user/idle-monitor.sh
+          chown ec2-user:ec2-user /home/ec2-user/idle-monitor.sh
+          
+          # Create systemd service for idle monitor
+          cat > /etc/systemd/system/idle-monitor.service << 'SERVICE'
+          [Unit]
+          Description=Sandbox Idle Monitor
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=ec2-user
+          ExecStart=/home/ec2-user/idle-monitor.sh
+          Restart=always
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+          
+          systemctl daemon-reload
+          systemctl enable idle-monitor
+          systemctl start idle-monitor
+      Tags:
+        - Key: Name
+          Value: !Sub '${SandboxName}-app-server'
+        - Key: Sandbox
+          Value: !Ref SandboxName
+
+  # IAM Role for Lambda (stack deletion)
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${SandboxName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DeleteStack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                  - rds:*
+                  - iam:*
+                  - events:*
+                  - lambda:*
+                  - logs:*
+                Resource: '*'
+
+  # Lambda function for scheduled termination
+  TerminationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${SandboxName}-terminator'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          
+          def handler(event, context):
+              stack_name = os.environ['STACK_NAME']
+              cf = boto3.client('cloudformation')
+              
+              print(f"Initiating termination of sandbox stack: {stack_name}")
+              
+              try:
+                  cf.delete_stack(StackName=stack_name)
+                  return {
+                      'statusCode': 200,
+                      'body': f'Stack {stack_name} deletion initiated'
+                  }
+              except Exception as e:
+                  print(f"Error deleting stack: {str(e)}")
+                  raise e
+      Tags:
+        - Key: Sandbox
+          Value: !Ref SandboxName
+
+  # EventBridge rule for scheduled termination
+  ScheduledTerminationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${SandboxName}-scheduled-termination'
+      Description: !Sub 'Terminate sandbox ${SandboxName} after ${ExpirationHours} hours'
+      ScheduleExpression: !Sub 'rate(${ExpirationHours} hours)'
+      State: ENABLED
+      Targets:
+        - Id: TerminateSandbox
+          Arn: !GetAtt TerminationLambda.Arn
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TerminationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledTerminationRule.Arn
+
+Outputs:
+  AppServerPublicIP:
+    Description: Public IP of the app server
+    Value: !GetAtt AppServer.PublicIp
+    Export:
+      Name: !Sub '${SandboxName}-AppServerIP'
+
+  AppServerPublicDNS:
+    Description: Public DNS of the app server
+    Value: !GetAtt AppServer.PublicDnsName
+    Export:
+      Name: !Sub '${SandboxName}-AppServerDNS'
+
+  AppURL:
+    Description: URL to access the todo application
+    Value: !Sub 'http://${AppServer.PublicDnsName}:3000'
+    Export:
+      Name: !Sub '${SandboxName}-AppURL'
+
+  DatabaseEndpoint:
+    Description: RDS database endpoint
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: !Sub '${SandboxName}-DBEndpoint'
+
+  SandboxName:
+    Description: Name of this sandbox
+    Value: !Ref SandboxName
+
+  ExpirationTime:
+    Description: Sandbox will auto-terminate after this many hours
+    Value: !Sub '${ExpirationHours} hours from creation'
+
+  StackName:
+    Description: CloudFormation stack name for API reference
+    Value: !Ref AWS::StackName
