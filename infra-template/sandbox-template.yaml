@@ -58,6 +58,17 @@ Parameters:
     Default: sandbox-todo-snapshot-20260129-234617
     Description: RDS snapshot to restore from
 
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair for SSH access
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Database password for the restored RDS instance
+    MinLength: 8
+    Default: todopassword123
+
 Resources:
   # Security Group for EC2
   AppSecurityGroup:
@@ -126,6 +137,7 @@ Resources:
       DBInstanceClass: !Ref DBInstanceClass
       Engine: postgres
       DBSnapshotIdentifier: !Ref DBSnapshotIdentifier
+      MasterUserPassword: !Ref DBPassword
       VPCSecurityGroups:
         - !Ref DBSecurityGroup
       DBSubnetGroupName: !Ref DBSubnetGroup
@@ -179,6 +191,7 @@ Resources:
       ImageId: !Ref AMIId
       InstanceType: !Ref InstanceType
       SubnetId: !Ref SubnetId
+      KeyName: !Ref KeyPairName
       SecurityGroupIds:
         - !Ref AppSecurityGroup
       IamInstanceProfile: !Ref EC2InstanceProfile
@@ -201,7 +214,7 @@ Resources:
           DATABASE_PORT=5432
           DATABASE_NAME=tododb
           DATABASE_USER=todouser
-          DATABASE_PASSWORD=todopassword123
+          DATABASE_PASSWORD=${DBPassword}
           PORT=3000
           EOF
           
@@ -209,82 +222,6 @@ Resources:
           
           # Restart the application
           systemctl restart todo-app || true
-          
-          # Install and configure idle monitor
-          cat > /home/ec2-user/idle-monitor.sh << 'MONITOR'
-          #!/bin/bash
-          STACK_NAME="${AWS::StackName}"
-          REGION="${AWS::Region}"
-          IDLE_THRESHOLD=3600  # 1 hour in seconds
-          
-          # Get network stats
-          get_network_bytes() {
-            cat /proc/net/dev | grep eth0 | awk '{print $2 + $10}'
-          }
-          
-          LAST_BYTES=$(get_network_bytes)
-          LAST_CHECK=$(date +%s)
-          IDLE_START=$LAST_CHECK
-          
-          while true; do
-            sleep 300  # Check every 5 minutes
-            
-            CURRENT_BYTES=$(get_network_bytes)
-            CURRENT_TIME=$(date +%s)
-            
-            # Calculate bytes transferred since last check
-            BYTES_DIFF=$((CURRENT_BYTES - LAST_BYTES))
-            
-            # If significant traffic (more than 10KB), reset idle timer
-            if [ $BYTES_DIFF -gt 10240 ]; then
-              IDLE_START=$CURRENT_TIME
-            fi
-            
-            # Check if idle for more than threshold
-            IDLE_DURATION=$((CURRENT_TIME - IDLE_START))
-            if [ $IDLE_DURATION -ge $IDLE_THRESHOLD ]; then
-              echo "Sandbox idle for $IDLE_DURATION seconds. Initiating termination..."
-              aws cloudformation delete-stack --stack-name $STACK_NAME --region $REGION
-              exit 0
-            fi
-            
-            # Publish idle metric to CloudWatch
-            aws cloudwatch put-metric-data \
-              --namespace "Sandbox/IdleMonitor" \
-              --metric-name "IdleDuration" \
-              --value $IDLE_DURATION \
-              --unit Seconds \
-              --dimensions StackName=$STACK_NAME \
-              --region $REGION
-            
-            LAST_BYTES=$CURRENT_BYTES
-            LAST_CHECK=$CURRENT_TIME
-          done
-          MONITOR
-          
-          chmod +x /home/ec2-user/idle-monitor.sh
-          chown ec2-user:ec2-user /home/ec2-user/idle-monitor.sh
-          
-          # Create systemd service for idle monitor
-          cat > /etc/systemd/system/idle-monitor.service << 'SERVICE'
-          [Unit]
-          Description=Sandbox Idle Monitor
-          After=network.target
-          
-          [Service]
-          Type=simple
-          User=ec2-user
-          ExecStart=/home/ec2-user/idle-monitor.sh
-          Restart=always
-          RestartSec=10
-          
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
-          
-          systemctl daemon-reload
-          systemctl enable idle-monitor
-          systemctl start idle-monitor
       Tags:
         - Key: Name
           Value: !Sub '${SandboxName}-app-server'
@@ -323,6 +260,7 @@ Resources:
                   - events:*
                   - lambda:*
                   - logs:*
+                  - cloudwatch:GetMetricStatistics
                 Resource: '*'
 
   # Lambda function for scheduled termination
@@ -381,6 +319,102 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt ScheduledTerminationRule.Arn
+
+  # Lambda function for idle check using CloudWatch metrics
+  IdleCheckLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${SandboxName}-idle-check'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+          INSTANCE_ID: !Ref AppServer
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          def handler(event, context):
+              stack_name = os.environ['STACK_NAME']
+              instance_id = os.environ['INSTANCE_ID']
+              
+              cw_client = boto3.client('cloudwatch')
+              cf_client = boto3.client('cloudformation')
+              
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(hours=1)
+              
+              response = cw_client.get_metric_statistics(
+                  Namespace='AWS/EC2',
+                  MetricName='NetworkPacketsIn',
+                  Dimensions=[
+                      {
+                          'Name': 'InstanceId',
+                          'Value': instance_id
+                      }
+                  ],
+                  StartTime=start_time,
+                  EndTime=end_time,
+                  Period=3600,
+                  Statistics=['Sum']
+              )
+              
+              datapoints = response.get('Datapoints', [])
+              
+              if not datapoints:
+                  print("No datapoints found, assuming idle")
+                  total_packets = 0
+              else:
+                  total_packets = sum(dp['Sum'] for dp in datapoints)
+              
+              print(f"Total network packets in last hour: {total_packets}")
+              
+              if total_packets == 0:
+                  print(f"No network activity detected. Initiating stack deletion: {stack_name}")
+                  try:
+                      cf_client.delete_stack(StackName=stack_name)
+                      return {
+                          'statusCode': 200,
+                          'body': f'Stack {stack_name} deletion initiated due to inactivity'
+                      }
+                  except Exception as e:
+                      print(f"Error deleting stack: {str(e)}")
+                      raise e
+              else:
+                  print(f"Network activity detected ({total_packets} packets). Stack remains active.")
+                  return {
+                      'statusCode': 200,
+                      'body': f'Stack {stack_name} is active with {total_packets} packets'
+                  }
+      Tags:
+        - Key: Sandbox
+          Value: !Ref SandboxName
+
+  # EventBridge rule for hourly idle check
+  IdleCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${SandboxName}-idle-check'
+      Description: Hourly check for network inactivity
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Id: IdleCheckTarget
+          Arn: !GetAtt IdleCheckLambda.Arn
+
+  # Permission for EventBridge to invoke idle check Lambda
+  IdleCheckLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdleCheckLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IdleCheckRule.Arn
 
 Outputs:
   AppServerPublicIP:

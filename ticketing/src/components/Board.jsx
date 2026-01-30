@@ -24,10 +24,16 @@ const STATUS_COLORS = {
   terminated: '#6b7280',
 };
 
+const DEVIN_ORG_ID = import.meta.env.VITE_DEVIN_ORG_ID || '';
+const DEFAULT_API_KEY = import.meta.env.VITE_COGNITION_API_KEY || '';
+
 export default function Board() {
   const [tickets, setTickets] = useState([]);
   const [activeTicket, setActiveTicket] = useState(null);
   const [apiLogs, setApiLogs] = useState([]);
+  const [apiKey, setApiKey] = useState(DEFAULT_API_KEY);
+  const [orgId, setOrgId] = useState(DEVIN_ORG_ID);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -72,12 +78,52 @@ export default function Board() {
 
     logApiCall('PATCH', `/api/tickets/${ticketId}/status`, payload, 200);
 
-    // Simulate API call
-    console.log('API Call:', {
-      method: 'PATCH',
-      url: `/api/tickets/${ticketId}/status`,
-      body: payload,
-    });
+    // If moving to provisioning, call Devin API
+    if (newStatus === 'provisioning' && apiKey && orgId) {
+      await callDevinApi(ticket);
+    }
+  };
+
+  const callDevinApi = async (ticket) => {
+    const prompt = `You are to fulfil an infra provisioning request in AWS to respond to this ticket:
+
+Ticket ID: ${ticket.id}
+Title: ${ticket.title}
+Description: ${ticket.description || 'No description provided'}
+Created: ${ticket.createdAt}
+
+Create the sandbox infrastructure, then respond with a status update as your final response. Use the infra template from https://github.com/Cognition-Partner-Workshops/todo-app-sandbox-infra in the \`infra-template\` subdirectory and the aws cli to deploy with your environment variable AWS credentials.`;
+
+    const requestPayload = {
+      prompt,
+    };
+
+    const apiUrl = `/api/devin/v3beta1/organizations/${orgId}/sessions`;
+    logApiCall('POST', apiUrl, requestPayload, 'pending');
+
+    try {
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestPayload),
+      });
+
+      const data = await response.json();
+      
+      if (response.ok) {
+        logApiCall('POST', apiUrl, { response: data }, response.status);
+        console.log('Devin session created:', data);
+      } else {
+        logApiCall('POST', apiUrl, { error: data }, response.status);
+        console.error('Devin API error:', data);
+      }
+    } catch (err) {
+      logApiCall('POST', apiUrl, { error: err.message }, 'error');
+      console.error('Devin API request failed:', err);
+    }
   };
 
   const findColumn = (id) => {
@@ -138,6 +184,40 @@ export default function Board() {
         <h1>🏗️ Infrastructure Sandbox Board</h1>
         <p>Drag tickets between columns to change their provisioning status</p>
       </header>
+
+      <div className="settings-section">
+        <button 
+          className="settings-toggle" 
+          onClick={() => setIsSettingsOpen(!isSettingsOpen)}
+        >
+          ⚙️ API Settings {isSettingsOpen ? '▲' : '▼'}
+        </button>
+        {isSettingsOpen && (
+          <div className="settings-form">
+            <div className="settings-field">
+              <label>Cognition API Key</label>
+              <input
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder="cog_xyz..."
+              />
+            </div>
+            <div className="settings-field">
+              <label>Organization ID</label>
+              <input
+                type="text"
+                value={orgId}
+                onChange={(e) => setOrgId(e.target.value)}
+                placeholder="your-org-id"
+              />
+            </div>
+            <p className="settings-hint">
+              {apiKey ? '✓ API key configured' : '⚠ No API key - Devin calls disabled'}
+            </p>
+          </div>
+        )}
+      </div>
 
       <AddTicketForm onAdd={addTicket} />
 
