@@ -201,24 +201,19 @@ Resources:
           set -e
           
           # Update database connection to point to new RDS
-          DB_HOST="${Database.Endpoint.Address}"
+          NEW_DB_HOST="${Database.Endpoint.Address}"
           
-          # Update the app's database configuration
-          if [ -f /home/ec2-user/todo-app/.env ]; then
-            sed -i "s|DATABASE_HOST=.*|DATABASE_HOST=$DB_HOST|" /home/ec2-user/todo-app/.env
-          fi
-          
-          # Create environment file if it doesn't exist
-          cat > /home/ec2-user/todo-app/.env << EOF
-          DATABASE_HOST=$DB_HOST
-          DATABASE_PORT=5432
-          DATABASE_NAME=tododb
-          DATABASE_USER=todouser
-          DATABASE_PASSWORD=${DBPassword}
+          # Create/update environment file at correct location
+          cat > /opt/todo-app/.env << EOF
+          DB_HOST=$NEW_DB_HOST
+          DB_PORT=5432
+          DB_NAME=todoapp
+          DB_USER=todouser
+          DB_PASSWORD=${DBPassword}
           PORT=3000
           EOF
           
-          chown ec2-user:ec2-user /home/ec2-user/todo-app/.env
+          chown ec2-user:ec2-user /opt/todo-app/.env
           
           # Restart the application
           systemctl restart todo-app || true
